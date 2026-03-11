@@ -111,15 +111,15 @@ def is_process_running(pid):
     if not pid or pid <= 0:
         return False
 
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    result = subprocess.run(
+        ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+        capture_output=True,
+        text=True,
+        creationflags=creation_flags,
+        check=False,
+    )
+    return f'"{pid}"' in result.stdout
 
 
 def ensure_single_instance():
@@ -170,6 +170,8 @@ def stop_running_app(timeout_seconds=10):
     remove_file(PID_FILE)
     remove_file(STOP_FILE)
 
+    if not is_process_running(pid):
+        return True, "알람 앱을 종료했습니다."
     if result.returncode == 0:
         return True, "알람 앱을 종료했습니다."
     return False, "알람 앱 종료에 실패했습니다. 작업 관리자에서 확인해 주세요."
@@ -193,6 +195,7 @@ class AlarmApp:
         self.triggered = set()
         self.snoozed = []
         self.lock = threading.Lock()
+        self.stop_event = threading.Event()
         self.config = self.load_config()
         self.running = True
 
@@ -441,12 +444,20 @@ class AlarmApp:
                     self.root.after(0, self.show_popup, alarm["title"], alarm["message"])
                 last_checked_minute = current_minute
 
-            time.sleep(CHECK_INTERVAL_SECONDS)
+            elapsed = 0.0
+            while self.running and elapsed < CHECK_INTERVAL_SECONDS:
+                if os.path.exists(STOP_FILE):
+                    self.root.after(0, self.shutdown)
+                    return
+                if self.stop_event.wait(timeout=0.5):
+                    return
+                elapsed += 0.5
 
     def shutdown(self):
         if not self.running:
             return
         self.running = False
+        self.stop_event.set()
         remove_file(STOP_FILE)
         if self.root.winfo_exists():
             self.root.quit()

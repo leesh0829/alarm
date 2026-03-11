@@ -1,12 +1,17 @@
+import argparse
 import json
 import os
+import subprocess
 import threading
 import time
 from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-CONFIG_FILE = "alarm_schedule.json"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(BASE_DIR, "alarm_schedule.json")
+PID_FILE = os.path.join(BASE_DIR, "alarm_app.pid")
+STOP_FILE = os.path.join(BASE_DIR, "alarm_app.stop")
 CHECK_INTERVAL_SECONDS = 15
 WINDOW_GEOMETRY = "460x220"
 DEFAULT_POSITION = "center"  # center | bottom_right
@@ -63,6 +68,124 @@ DEFAULT_CONFIG = {
 }
 
 
+def show_message(kind, title, message):
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        if kind == "error":
+            messagebox.showerror(title, message, parent=root)
+        else:
+            messagebox.showinfo(title, message, parent=root)
+    finally:
+        root.destroy()
+
+
+def read_pid():
+    if not os.path.exists(PID_FILE):
+        return None
+
+    try:
+        with open(PID_FILE, "r", encoding="utf-8") as f:
+            value = f.read().strip()
+    except OSError:
+        return None
+
+    if not value.isdigit():
+        return None
+    return int(value)
+
+
+def write_pid(pid):
+    with open(PID_FILE, "w", encoding="utf-8") as f:
+        f.write(str(pid))
+
+
+def remove_file(path):
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def is_process_running(pid):
+    if not pid or pid <= 0:
+        return False
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def ensure_single_instance():
+    existing_pid = read_pid()
+    current_pid = os.getpid()
+
+    if existing_pid and existing_pid != current_pid and is_process_running(existing_pid):
+        raise RuntimeError(f"이미 실행 중입니다. PID: {existing_pid}")
+
+    remove_file(STOP_FILE)
+    write_pid(current_pid)
+
+
+def request_stop():
+    with open(STOP_FILE, "w", encoding="utf-8") as f:
+        f.write(str(time.time()))
+
+
+def stop_running_app(timeout_seconds=10):
+    pid = read_pid()
+    if not pid:
+        return False, "실행 중인 알람 앱이 없습니다."
+
+    if not is_process_running(pid):
+        remove_file(PID_FILE)
+        remove_file(STOP_FILE)
+        return False, "이미 종료된 프로세스였습니다. PID 파일만 정리했습니다."
+
+    request_stop()
+
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if not is_process_running(pid):
+            remove_file(PID_FILE)
+            remove_file(STOP_FILE)
+            return True, "알람 앱을 종료했습니다."
+        time.sleep(0.2)
+
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    result = subprocess.run(
+        ["taskkill", "/PID", str(pid), "/T", "/F"],
+        capture_output=True,
+        text=True,
+        creationflags=creation_flags,
+        check=False,
+    )
+
+    remove_file(PID_FILE)
+    remove_file(STOP_FILE)
+
+    if result.returncode == 0:
+        return True, "알람 앱을 종료했습니다."
+    return False, "알람 앱 종료에 실패했습니다. 작업 관리자에서 확인해 주세요."
+
+
+def get_status_message():
+    pid = read_pid()
+    if not pid:
+        return "알람 앱이 실행 중이 아닙니다."
+    if not is_process_running(pid):
+        remove_file(PID_FILE)
+        remove_file(STOP_FILE)
+        return "실행 중이 아닌 이전 PID 파일을 정리했습니다."
+    return f"알람 앱이 실행 중입니다. PID: {pid}"
+
+
 class AlarmApp:
     def __init__(self):
         self.root = tk.Tk()
@@ -93,8 +216,9 @@ class AlarmApp:
 
         normalized = []
         for time_value in raw_times:
+            candidate = str(time_value).strip().replace(",", ":")
             try:
-                t = datetime.strptime(str(time_value), "%H:%M")
+                t = datetime.strptime(candidate, "%H:%M")
             except ValueError as exc:
                 raise ValueError(f"잘못된 시간 형식: {time_value}") from exc
             normalized.append(t.strftime("%H:%M"))
@@ -299,6 +423,10 @@ class AlarmApp:
         last_checked_minute = None
 
         while self.running:
+            if os.path.exists(STOP_FILE):
+                self.root.after(0, self.shutdown)
+                break
+
             self.reload_config()
             now = datetime.now()
             current_minute = now.strftime("%Y-%m-%d %H:%M")
@@ -315,13 +443,54 @@ class AlarmApp:
 
             time.sleep(CHECK_INTERVAL_SECONDS)
 
+    def shutdown(self):
+        if not self.running:
+            return
+        self.running = False
+        remove_file(STOP_FILE)
+        if self.root.winfo_exists():
+            self.root.quit()
+            self.root.destroy()
+
     def run(self):
+        self.root.protocol("WM_DELETE_WINDOW", self.shutdown)
         thread = threading.Thread(target=self.scheduler_loop, daemon=True)
         thread.start()
         self.root.mainloop()
         self.running = False
+        remove_file(PID_FILE)
+        remove_file(STOP_FILE)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Windows alarm popup app")
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=["start", "stop", "status"],
+        default="start",
+        help="start: 실행, stop: 종료, status: 상태 확인",
+    )
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    app = AlarmApp()
-    app.run()
+    args = parse_args()
+
+    if args.command == "stop":
+        ok, message = stop_running_app()
+        print(message)
+        show_message("info" if ok else "error", "알람 종료", message)
+    elif args.command == "status":
+        message = get_status_message()
+        print(message)
+        show_message("info", "알람 상태", message)
+    else:
+        try:
+            ensure_single_instance()
+            app = AlarmApp()
+            app.run()
+        except RuntimeError as exc:
+            message = str(exc)
+            print(message)
+            show_message("info", "알람 실행", message)

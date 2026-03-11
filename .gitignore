@@ -1,1 +1,4 @@
 alarm_schedule.json
+alarm_app.pid
+alarm_app.stop
+__pycache__/

@@ -2,25 +2,63 @@ import json
 import os
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import messagebox, ttk
 
 CONFIG_FILE = "alarm_schedule.json"
 CHECK_INTERVAL_SECONDS = 15
-WINDOW_GEOMETRY = "420x180"
+WINDOW_GEOMETRY = "460x220"
 DEFAULT_POSITION = "center"  # center | bottom_right
+
+WEEKDAY_MAP = {
+    "mon": 0,
+    "monday": 0,
+    "월": 0,
+    "화": 1,
+    "tue": 1,
+    "tuesday": 1,
+    "수": 2,
+    "wed": 2,
+    "wednesday": 2,
+    "목": 3,
+    "thu": 3,
+    "thursday": 3,
+    "금": 4,
+    "fri": 4,
+    "friday": 4,
+    "토": 5,
+    "sat": 5,
+    "saturday": 5,
+    "일": 6,
+    "sun": 6,
+    "sunday": 6,
+}
 
 
 DEFAULT_CONFIG = {
     "position": "center",
     "alarms": [
         {
-            "date": "2026-03-12",
+            "type": "daily",
             "times": ["09:00", "13:30", "18:00"],
-            "title": "알람",
+            "title": "매일 알람",
             "message": "확인할 작업이 있어요.",
-        }
+        },
+        {
+            "type": "weekday",
+            "weekdays": ["mon", "wed", "fri"],
+            "times": ["08:40"],
+            "title": "운동 알람",
+            "message": "운동 갈 시간이에요!",
+        },
+        {
+            "type": "once",
+            "date": "2026-03-12",
+            "times": ["15:00"],
+            "title": "단일 알람",
+            "message": "오늘만 울리는 알람",
+        },
     ],
 }
 
@@ -30,53 +68,165 @@ class AlarmApp:
         self.root = tk.Tk()
         self.root.withdraw()  # 메인창 숨김
         self.triggered = set()
+        self.snoozed = []
         self.lock = threading.Lock()
         self.config = self.load_config()
         self.running = True
+
+    def normalize_weekdays(self, raw_weekdays):
+        normalized = []
+        for day in raw_weekdays:
+            if isinstance(day, int) and 0 <= day <= 6:
+                normalized.append(day)
+                continue
+
+            key = str(day).strip().lower()
+            if key not in WEEKDAY_MAP:
+                raise ValueError(f"지원하지 않는 요일 값: {day}")
+            normalized.append(WEEKDAY_MAP[key])
+
+        return sorted(set(normalized))
+
+    def normalize_times(self, raw_times):
+        if not isinstance(raw_times, list) or not raw_times:
+            raise ValueError("times는 최소 1개 이상의 HH:MM 문자열 리스트여야 합니다.")
+
+        normalized = []
+        for time_value in raw_times:
+            try:
+                t = datetime.strptime(str(time_value), "%H:%M")
+            except ValueError as exc:
+                raise ValueError(f"잘못된 시간 형식: {time_value}") from exc
+            normalized.append(t.strftime("%H:%M"))
+
+        return sorted(set(normalized))
+
+    def validate_and_normalize_config(self, data):
+        if not isinstance(data, dict):
+            raise ValueError("설정 루트는 객체(JSON object)여야 합니다.")
+
+        position = data.get("position", DEFAULT_POSITION)
+        if position not in {"center", "bottom_right"}:
+            raise ValueError("position은 center 또는 bottom_right 만 허용됩니다.")
+
+        alarms = data.get("alarms")
+        if not isinstance(alarms, list) or not alarms:
+            raise ValueError("alarms는 최소 1개 이상의 리스트여야 합니다.")
+
+        normalized_alarms = []
+        for idx, alarm in enumerate(alarms):
+            if not isinstance(alarm, dict):
+                raise ValueError(f"alarms[{idx}]는 객체여야 합니다.")
+
+            alarm_type = alarm.get("type")
+            if alarm_type is None:
+                alarm_type = "once" if "date" in alarm else "daily"
+
+            if alarm_type not in {"once", "daily", "weekday"}:
+                raise ValueError(f"alarms[{idx}].type은 once/daily/weekday 중 하나여야 합니다.")
+
+            normalized_alarm = {
+                "type": alarm_type,
+                "times": self.normalize_times(alarm.get("times", [])),
+                "title": str(alarm.get("title", "알람")).strip() or "알람",
+                "message": str(alarm.get("message", "확인할 작업이 있어요.")).strip() or "확인할 작업이 있어요.",
+            }
+
+            if alarm_type == "once":
+                date_value = alarm.get("date")
+                if not date_value:
+                    raise ValueError(f"alarms[{idx}]는 once 타입일 때 date가 필요합니다.")
+                try:
+                    datetime.strptime(str(date_value), "%Y-%m-%d")
+                except ValueError as exc:
+                    raise ValueError(f"alarms[{idx}].date 형식은 YYYY-MM-DD 이어야 합니다.") from exc
+                normalized_alarm["date"] = str(date_value)
+
+            if alarm_type == "weekday":
+                weekdays = alarm.get("weekdays")
+                if not isinstance(weekdays, list) or not weekdays:
+                    raise ValueError(f"alarms[{idx}]는 weekday 타입일 때 weekdays 리스트가 필요합니다.")
+                normalized_alarm["weekdays"] = self.normalize_weekdays(weekdays)
+
+            normalized_alarms.append(normalized_alarm)
+
+        return {"position": position, "alarms": normalized_alarms}
 
     def load_config(self):
         if not os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=2)
-            return DEFAULT_CONFIG
+            return self.validate_and_normalize_config(DEFAULT_CONFIG)
 
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
+                loaded = json.load(f)
+            return self.validate_and_normalize_config(loaded)
+        except Exception as exc:
             messagebox.showerror(
                 "설정 파일 오류",
-                f"{CONFIG_FILE} 파일을 읽을 수 없습니다.\n형식을 확인하세요.",
+                f"{CONFIG_FILE} 파일을 읽을 수 없거나 형식이 잘못되었습니다.\n\n{exc}",
             )
-            return DEFAULT_CONFIG
+            return self.validate_and_normalize_config(DEFAULT_CONFIG)
 
     def reload_config(self):
         with self.lock:
             self.config = self.load_config()
 
+    def is_alarm_due_today(self, alarm, now):
+        alarm_type = alarm.get("type")
+        if alarm_type == "daily":
+            return True
+        if alarm_type == "once":
+            return alarm.get("date") == now.strftime("%Y-%m-%d")
+        if alarm_type == "weekday":
+            return now.weekday() in alarm.get("weekdays", [])
+        return False
+
     def get_due_alarms(self, now):
         due = []
-        date_str = now.strftime("%Y-%m-%d")
         current_minute = now.strftime("%H:%M")
+        occurrence_date = now.strftime("%Y-%m-%d")
 
         alarms = self.config.get("alarms", [])
-        for item in alarms:
-            if item.get("date") != date_str:
+        for idx, item in enumerate(alarms):
+            if not self.is_alarm_due_today(item, now):
                 continue
 
             for t in item.get("times", []):
-                alarm_key = f"{item.get('date')}|{t}|{item.get('title', '알람')}|{item.get('message', '')}"
+                alarm_key = f"{occurrence_date}|{idx}|{t}|{item.get('title', '알람')}"
                 if t == current_minute and alarm_key not in self.triggered:
-                    due.append({
-                        "key": alarm_key,
-                        "title": item.get("title", "알람"),
-                        "message": item.get("message", "확인할 작업이 있어요."),
-                    })
+                    due.append(
+                        {
+                            "key": alarm_key,
+                            "title": item.get("title", "알람"),
+                            "message": item.get("message", "확인할 작업이 있어요."),
+                        }
+                    )
         return due
+
+    def get_due_snoozed(self, now):
+        due = []
+        with self.lock:
+            remaining = []
+            for item in self.snoozed:
+                if item["due"] <= now:
+                    due.append(item)
+                else:
+                    remaining.append(item)
+            self.snoozed = remaining
+        return due
+
+    def schedule_snooze(self, title, message, minutes=5):
+        due_at = datetime.now() + timedelta(minutes=minutes)
+        with self.lock:
+            self.snoozed.append({"due": due_at, "title": title, "message": message})
 
     def mark_triggered(self, key):
         with self.lock:
             self.triggered.add(key)
+            if len(self.triggered) > 5000:
+                self.triggered = set(sorted(self.triggered)[-2000:])
 
     def show_popup(self, title, message):
         popup = tk.Toplevel(self.root)
@@ -89,23 +239,38 @@ class AlarmApp:
         frame = ttk.Frame(popup, padding=16)
         frame.pack(fill="both", expand=True)
 
+        badge = ttk.Label(frame, text="⏰", font=("Malgun Gothic", 20, "bold"))
+        badge.pack(anchor="w")
+
         title_label = ttk.Label(frame, text=title, font=("Malgun Gothic", 14, "bold"))
-        title_label.pack(anchor="w", pady=(0, 10))
+        title_label.pack(anchor="w", pady=(2, 8))
 
         message_label = ttk.Label(
             frame,
             text=message,
             font=("Malgun Gothic", 11),
-            wraplength=360,
+            wraplength=390,
             justify="left",
         )
         message_label.pack(anchor="w", fill="x")
 
+        help_label = ttk.Label(frame, text="지금 할 일이라면 바로 처리하세요.", font=("Malgun Gothic", 9))
+        help_label.pack(anchor="w", pady=(8, 0))
+
         button_frame = ttk.Frame(frame)
-        button_frame.pack(fill="x", pady=(18, 0))
+        button_frame.pack(fill="x", pady=(16, 0))
+
+        snooze_button = ttk.Button(
+            button_frame,
+            text="5분 후 다시",
+            command=lambda: (self.schedule_snooze(title, message, 5), popup.destroy()),
+        )
+        snooze_button.pack(side="left")
 
         close_button = ttk.Button(button_frame, text="닫기", command=popup.destroy)
         close_button.pack(side="right")
+
+        popup.bind("<Escape>", lambda _event: popup.destroy())
 
         popup.update_idletasks()
         self.place_popup(popup)
@@ -137,6 +302,9 @@ class AlarmApp:
             self.reload_config()
             now = datetime.now()
             current_minute = now.strftime("%Y-%m-%d %H:%M")
+
+            for snoozed_alarm in self.get_due_snoozed(now):
+                self.root.after(0, self.show_popup, snoozed_alarm["title"], snoozed_alarm["message"])
 
             if current_minute != last_checked_minute:
                 due_alarms = self.get_due_alarms(now)

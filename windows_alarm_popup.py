@@ -1,9 +1,11 @@
 import argparse
+import ctypes
 import json
 import os
 import subprocess
 import threading
 import time
+from ctypes import wintypes
 from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -15,6 +17,30 @@ STOP_FILE = os.path.join(BASE_DIR, "alarm_app.stop")
 CHECK_INTERVAL_SECONDS = 15
 WINDOW_GEOMETRY = "460x220"
 DEFAULT_POSITION = "center"  # center | bottom_right
+
+WM_APP = 0x8000
+WM_CLOSE = 0x0010
+WM_COMMAND = 0x0111
+WM_CONTEXTMENU = 0x007B
+WM_DESTROY = 0x0002
+WM_LBUTTONDBLCLK = 0x0203
+WM_RBUTTONUP = 0x0205
+TRAY_CALLBACK_MSG = WM_APP + 1
+
+NIM_ADD = 0x00000000
+NIM_DELETE = 0x00000002
+NIF_MESSAGE = 0x00000001
+NIF_ICON = 0x00000002
+NIF_TIP = 0x00000004
+
+IDI_APPLICATION = 32512
+MF_STRING = 0x00000000
+TPM_LEFTALIGN = 0x0000
+TPM_RIGHTBUTTON = 0x0002
+
+MENU_OPEN_CONFIG = 1001
+MENU_SHOW_STATUS = 1002
+MENU_EXIT_APP = 1003
 
 WEEKDAY_MAP = {
     "mon": 0,
@@ -66,6 +92,78 @@ DEFAULT_CONFIG = {
         },
     ],
 }
+
+if os.name == "nt":
+    lresult_type = getattr(wintypes, "LRESULT", ctypes.c_ssize_t)
+    user32 = ctypes.windll.user32
+    shell32 = ctypes.windll.shell32
+    kernel32 = ctypes.windll.kernel32
+    WNDPROC = ctypes.WINFUNCTYPE(
+        lresult_type,
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
+    )
+
+
+class GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", wintypes.DWORD),
+        ("Data2", wintypes.WORD),
+        ("Data3", wintypes.WORD),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+
+class WNDCLASSW(ctypes.Structure):
+    _fields_ = [
+        ("style", wintypes.UINT),
+        ("lpfnWndProc", WNDPROC),
+        ("cbClsExtra", ctypes.c_int),
+        ("cbWndExtra", ctypes.c_int),
+        ("hInstance", wintypes.HINSTANCE),
+        ("hIcon", wintypes.HICON),
+        ("hCursor", wintypes.HANDLE),
+        ("hbrBackground", wintypes.HBRUSH),
+        ("lpszMenuName", wintypes.LPCWSTR),
+        ("lpszClassName", wintypes.LPCWSTR),
+    ]
+
+
+class POINT(ctypes.Structure):
+    _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+
+class MSG(ctypes.Structure):
+    _fields_ = [
+        ("hwnd", wintypes.HWND),
+        ("message", wintypes.UINT),
+        ("wParam", wintypes.WPARAM),
+        ("lParam", wintypes.LPARAM),
+        ("time", wintypes.DWORD),
+        ("pt", POINT),
+    ]
+
+
+class NOTIFYICONDATAW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("hWnd", wintypes.HWND),
+        ("uID", wintypes.UINT),
+        ("uFlags", wintypes.UINT),
+        ("uCallbackMessage", wintypes.UINT),
+        ("hIcon", wintypes.HICON),
+        ("szTip", wintypes.WCHAR * 128),
+        ("dwState", wintypes.DWORD),
+        ("dwStateMask", wintypes.DWORD),
+        ("szInfo", wintypes.WCHAR * 256),
+        ("uVersion", wintypes.UINT),
+        ("szInfoTitle", wintypes.WCHAR * 64),
+        ("dwInfoFlags", wintypes.DWORD),
+        ("guidItem", GUID),
+        ("hBalloonIcon", wintypes.HICON),
+    ]
 
 
 def show_message(kind, title, message):
@@ -188,6 +286,145 @@ def get_status_message():
     return f"알람 앱이 실행 중입니다. PID: {pid}"
 
 
+class WinTrayIcon:
+    def __init__(self, app):
+        self.app = app
+        self.thread = None
+        self.hwnd = None
+        self.icon_handle = None
+        self.class_name = f"AlarmTrayWindow_{os.getpid()}"
+        self.hinstance = kernel32.GetModuleHandleW(None)
+        self._ready = threading.Event()
+        self._wndproc = WNDPROC(self._window_proc)
+
+    def start(self):
+        self.thread = threading.Thread(target=self._message_loop, daemon=True)
+        self.thread.start()
+        self._ready.wait(timeout=5)
+
+    def stop(self):
+        hwnd = self.hwnd
+        if hwnd:
+            user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+
+        if self.thread and self.thread.is_alive() and threading.current_thread() is not self.thread:
+            self.thread.join(timeout=5)
+
+    def _message_loop(self):
+        window_class = WNDCLASSW()
+        window_class.lpfnWndProc = self._wndproc
+        window_class.hInstance = self.hinstance
+        window_class.lpszClassName = self.class_name
+        window_class.hIcon = user32.LoadIconW(None, IDI_APPLICATION)
+
+        atom = user32.RegisterClassW(ctypes.byref(window_class))
+        if not atom:
+            self._ready.set()
+            return
+
+        self.icon_handle = user32.LoadIconW(None, IDI_APPLICATION)
+        self.hwnd = user32.CreateWindowExW(
+            0,
+            self.class_name,
+            self.class_name,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            self.hinstance,
+            None,
+        )
+
+        if not self.hwnd:
+            user32.UnregisterClassW(self.class_name, self.hinstance)
+            self._ready.set()
+            return
+
+        self._add_icon()
+        self._ready.set()
+
+        message = MSG()
+        while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(message))
+            user32.DispatchMessageW(ctypes.byref(message))
+
+        self.hwnd = None
+        user32.UnregisterClassW(self.class_name, self.hinstance)
+
+    def _notify_icon_data(self):
+        data = NOTIFYICONDATAW()
+        data.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+        data.hWnd = self.hwnd
+        data.uID = 1
+        data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+        data.uCallbackMessage = TRAY_CALLBACK_MSG
+        data.hIcon = self.icon_handle
+        data.szTip = "Alarm Popup"
+        return data
+
+    def _add_icon(self):
+        shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._notify_icon_data()))
+
+    def _remove_icon(self):
+        if self.hwnd:
+            shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(self._notify_icon_data()))
+
+    def _show_menu(self):
+        menu = user32.CreatePopupMenu()
+        user32.AppendMenuW(menu, MF_STRING, MENU_OPEN_CONFIG, "설정 파일 열기")
+        user32.AppendMenuW(menu, MF_STRING, MENU_SHOW_STATUS, "상태 보기")
+        user32.AppendMenuW(menu, MF_STRING, MENU_EXIT_APP, "종료")
+
+        cursor = POINT()
+        user32.GetCursorPos(ctypes.byref(cursor))
+        user32.SetForegroundWindow(self.hwnd)
+        user32.TrackPopupMenu(
+            menu,
+            TPM_LEFTALIGN | TPM_RIGHTBUTTON,
+            cursor.x,
+            cursor.y,
+            0,
+            self.hwnd,
+            None,
+        )
+        user32.DestroyMenu(menu)
+
+    def _window_proc(self, hwnd, msg, wparam, lparam):
+        if msg == TRAY_CALLBACK_MSG:
+            if lparam == WM_LBUTTONDBLCLK:
+                self.app.root.after(0, self.app.open_config_file)
+                return 0
+            if lparam in {WM_RBUTTONUP, WM_CONTEXTMENU}:
+                self._show_menu()
+                return 0
+
+        if msg == WM_COMMAND:
+            command_id = wparam & 0xFFFF
+            if command_id == MENU_OPEN_CONFIG:
+                self.app.root.after(0, self.app.open_config_file)
+                return 0
+            if command_id == MENU_SHOW_STATUS:
+                self.app.root.after(0, self.app.show_status_popup)
+                return 0
+            if command_id == MENU_EXIT_APP:
+                self.app.root.after(0, self.app.shutdown)
+                return 0
+
+        if msg == WM_CLOSE:
+            user32.DestroyWindow(hwnd)
+            return 0
+
+        if msg == WM_DESTROY:
+            self._remove_icon()
+            user32.PostQuitMessage(0)
+            return 0
+
+        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+
 class AlarmApp:
     def __init__(self):
         self.root = tk.Tk()
@@ -196,6 +433,7 @@ class AlarmApp:
         self.snoozed = []
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
+        self.tray_icon = WinTrayIcon(self)
         self.config = self.load_config()
         self.running = True
 
@@ -349,6 +587,15 @@ class AlarmApp:
         with self.lock:
             self.snoozed.append({"due": due_at, "title": title, "message": message})
 
+    def open_config_file(self):
+        try:
+            os.startfile(CONFIG_FILE)
+        except OSError as exc:
+            show_message("error", "설정 파일 열기 실패", str(exc))
+
+    def show_status_popup(self):
+        show_message("info", "알람 상태", get_status_message())
+
     def mark_triggered(self, key):
         with self.lock:
             self.triggered.add(key)
@@ -458,6 +705,9 @@ class AlarmApp:
             return
         self.running = False
         self.stop_event.set()
+        if self.tray_icon:
+            self.tray_icon.stop()
+            self.tray_icon = None
         remove_file(STOP_FILE)
         if self.root.winfo_exists():
             self.root.quit()
@@ -465,6 +715,7 @@ class AlarmApp:
 
     def run(self):
         self.root.protocol("WM_DELETE_WINDOW", self.shutdown)
+        self.tray_icon.start()
         thread = threading.Thread(target=self.scheduler_loop, daemon=True)
         thread.start()
         self.root.mainloop()

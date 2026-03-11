@@ -95,6 +95,8 @@ DEFAULT_CONFIG = {
 
 if os.name == "nt":
     lresult_type = getattr(wintypes, "LRESULT", ctypes.c_ssize_t)
+    hmenu_type = getattr(wintypes, "HMENU", wintypes.HANDLE)
+    uint_ptr_type = getattr(wintypes, "UINT_PTR", wintypes.WPARAM)
     user32 = ctypes.windll.user32
     shell32 = ctypes.windll.shell32
     kernel32 = ctypes.windll.kernel32
@@ -105,6 +107,32 @@ if os.name == "nt":
         wintypes.WPARAM,
         wintypes.LPARAM,
     )
+
+    user32.CreatePopupMenu.restype = hmenu_type
+    user32.CreatePopupMenu.argtypes = []
+    user32.AppendMenuW.restype = wintypes.BOOL
+    user32.AppendMenuW.argtypes = [hmenu_type, wintypes.UINT, uint_ptr_type, wintypes.LPCWSTR]
+    user32.TrackPopupMenu.restype = wintypes.BOOL
+    user32.TrackPopupMenu.argtypes = [
+        hmenu_type,
+        wintypes.UINT,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.HWND,
+        ctypes.c_void_p,
+    ]
+    user32.DestroyMenu.restype = wintypes.BOOL
+    user32.DestroyMenu.argtypes = [hmenu_type]
+    user32.SetForegroundWindow.restype = wintypes.BOOL
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32.DefWindowProcW.restype = lresult_type
+    user32.DefWindowProcW.argtypes = [
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
+    ]
 
 
 class GUID(ctypes.Structure):
@@ -133,6 +161,11 @@ class WNDCLASSW(ctypes.Structure):
 
 class POINT(ctypes.Structure):
     _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+
+if os.name == "nt":
+    user32.GetCursorPos.restype = wintypes.BOOL
+    user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
 
 
 class MSG(ctypes.Structure):
